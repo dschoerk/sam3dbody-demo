@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# External vendored repos and generated output
+vendor/
+output/

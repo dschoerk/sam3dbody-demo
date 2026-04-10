@@ -68,11 +68,6 @@ In webcam mode, the FOV estimator (MoGe) runs on the first frame to estimate cam
 ### CUDA warmup (always on)
 A dummy 256×192 black frame is passed through the model immediately after load. This forces CUDA kernel JIT compilation before the first real frame, eliminating the ~2 s spike on the initial inference call.
 
-### SDPA attention (already active, no flag needed)
-The loaded checkpoint uses `dinov3_vith16plus` from [facebookresearch/dinov3](https://github.com/facebookresearch/dinov3), which already uses `F.scaled_dot_product_attention` (Flash Attention 2 backend) natively. No modification was needed.
-
-> **Note:** The `vit.py` file in `sam-3d-body/models/backbones/` contains a separate `FlashAttention` class and a `FLASH_ATTN` config key, but these apply only to the `vit`/`vit_l`/`vit_b` checkpoint variants. The `dinov3_vith16plus` checkpoint used here does not go through that code path.
-
 ---
 
 ## Benchmark

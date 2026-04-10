@@ -80,10 +80,8 @@ VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def _autocast_ctx(args):
-    """Return an autocast context if --bf16 was passed, otherwise a no-op."""
-    if args.bf16:
-        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+def _autocast_ctx(_args):
+    """No-op — autocast breaks sparse ops used by this model."""
     return contextlib.nullcontext()
 
 
@@ -113,6 +111,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-detector", action="store_true",
         help="Skip automatic person detector (treat whole image as one person)",
+    )
+    p.add_argument(
+        "--detector", default="vitdet",
+        help="Person detector: vitdet (accurate, slow) or yolo11n.pt / yolo11s.pt (fast)",
     )
     p.add_argument(
         "--no-fov", action="store_true",
@@ -147,12 +149,20 @@ def parse_args() -> argparse.Namespace:
         help="[Webcam] Hide the 3D skeleton panel (show only the 2D overlay)",
     )
     p.add_argument(
+        "--det-interval", type=int, default=1, metavar="N",
+        help="[Webcam] Re-run person detector every N frames, reuse bbox in between (e.g. 10)",
+    )
+    p.add_argument(
         "--body-only", action="store_true",
         help="Run body decoder only — skips the two hand forward passes (~3× faster, less accurate fingers)",
     )
     p.add_argument(
-        "--bf16", action="store_true",
-        help="Run inference under torch.autocast bfloat16 (faster on Ampere+, RTX 30/40 series)",
+        "--tf32", action="store_true",
+        help="Enable TF32 for matmuls (free speedup on Ampere+/RTX 30/40, no dtype change)",
+    )
+    p.add_argument(
+        "--compile", action="store_true",
+        help="torch.compile the ViT backbone (~30s warmup, then ~20-40%% faster per frame)",
     )
     return p.parse_args()
 
@@ -162,10 +172,18 @@ def load_estimator(args: argparse.Namespace):
     logger.info(f"Loading SAM-3D-Body model: {args.model}")
     estimator = setup_sam_3d_body(
         hf_repo_id=args.model,
-        detector_name=None if args.no_detector else "vitdet",
+        detector_name=None if args.no_detector else args.detector,
         segmentor_name="sam2",
         fov_name=None if args.no_fov else "moge2",
     )
+    if args.compile:
+        logger.info("Compiling ViT backbone with torch.compile (this takes ~30s)…")
+        estimator.model.backbone = torch.compile(estimator.model.backbone)
+
+    logger.info("Warming up CUDA kernels…")
+    _warmup = np.zeros((256, 192, 3), dtype=np.uint8)
+    with _quiet(), _autocast_ctx(args):
+        estimator.process_one_image(_warmup)
     logger.info("Model ready.")
     return estimator
 
@@ -180,7 +198,7 @@ def run_image(estimator, image_path: Path, output_path: Path, args: argparse.Nam
         return
 
     with _quiet(), _autocast_ctx(args):
-        outputs = estimator.process_one_image(str(image_path))
+        outputs = estimator.process_one_image(img_bgr)
     if not outputs:
         logger.warning("No humans detected.")
         return
@@ -563,6 +581,8 @@ def run_webcam(estimator, args: argparse.Namespace):
     # ── Inference thread ────────────────────────────────────────────────────
     def _infer():
         frame_n = 0
+        cached_cam_int = None   # estimated once from first frame, reused thereafter
+        cached_bboxes = None    # reused between detector runs
         # Rolling timing accumulators (seconds)
         t_write = t_infer = t_vis = 0.0
         REPORT_EVERY = 5
@@ -575,7 +595,7 @@ def run_webcam(estimator, args: argparse.Namespace):
 
             # ① convert BGR→RGB (estimator expects RGB for numpy input; no disk write)
             t0 = time.perf_counter()
-            frame_rgb = frame #cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_rgb = frame
             t_write += time.perf_counter() - t0
 
             # ② model inference
@@ -585,11 +605,22 @@ def run_webcam(estimator, args: argparse.Namespace):
             try:
                 _real_empty_cache = torch.cuda.empty_cache
                 torch.cuda.empty_cache = lambda: None
+                if cached_cam_int is None:
+                    fov_est = getattr(estimator, 'fov_estimator', None)
+                    if fov_est is not None:
+                        with _quiet():
+                            cached_cam_int = fov_est.get_cam_intrinsics(frame_rgb)
+                        logger.info("Camera intrinsics cached — FOV estimator skipped on subsequent frames.")
+                run_det = (cached_bboxes is None or frame_n % args.det_interval == 0)
                 with _quiet(), _autocast_ctx(args):
                     outputs = estimator.process_one_image(
                         frame_rgb,
+                        bboxes=None if run_det else cached_bboxes,
+                        cam_int=cached_cam_int,
                         inference_type="body" if args.body_only else "full",
                     )
+                if outputs:
+                    cached_bboxes = np.stack([o["bbox"] for o in outputs])
             except Exception as exc:
                 logger.warning(f"Inference error: {exc}")
                 outputs = None
@@ -600,8 +631,8 @@ def run_webcam(estimator, args: argparse.Namespace):
             # ③ 2D visualisation
             t0 = time.perf_counter()
             if outputs:
-                vis_list = visualize_2d_results(frame, outputs, visualizer)
-                annotated = vis_list[0] if vis_list else frame
+                vis_list = visualize_2d_results(frame_rgb, outputs, visualizer)
+                annotated = vis_list[0] if vis_list else frame_rgb
             else:
                 annotated = frame
                 outputs = []
@@ -695,8 +726,8 @@ def run_webcam(estimator, args: argparse.Namespace):
             if over and now - last_beep_time >= BEEP_INTERVAL:
                 threading.Thread(target=_beep, daemon=True).start()
                 last_beep_time = now
-            
-            if lean_angles[0] < LEAN_THRESHOLD:
+
+            if not over:
                 lean_history.clear()
 
         cv2.imshow("SAM-3D-Body | Webcam", display)
@@ -713,6 +744,11 @@ def run_webcam(estimator, args: argparse.Namespace):
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     args = parse_args()
+
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("TF32 enabled for matmuls.")
 
     if args.webcam:
         estimator = load_estimator(args)

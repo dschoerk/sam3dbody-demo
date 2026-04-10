@@ -12,3 +12,8 @@ wheels/
 # External vendored repos and generated output
 vendor/
 output/
+
+# Model weights
+*.pt
+*.ckpt
+*.pkl

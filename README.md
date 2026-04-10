@@ -2,6 +2,8 @@
 
 Real-time 3D human mesh recovery from webcam, images, and video, built on top of [facebookresearch/sam-3d-body](https://github.com/facebookresearch/sam-3d-body). I built this demo to simply test Sam3D-Body on my machine, see real-time performance and quality of output for inference from a webcam. To give the project some purpose, the demo aims to correct the users posture when sitting at the PC. It estimates the forward leaning angle from the spine to play an audible *beep* when the user is leaning forward too much. 
 
+![Webcam demo showing person detection, lean angle overlay, and 3D skeleton](Screenshot_20260410_143020.png)
+
 ## Setup
 
 ```bash

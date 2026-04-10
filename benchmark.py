@@ -102,13 +102,17 @@ def load_estimator(cfg: dict, model: str) -> object:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
 
+    is_yolo = cfg["detector"].startswith("yolo")
     with _quiet():
         estimator = setup_sam_3d_body(
             hf_repo_id=model,
-            detector_name=cfg["detector"],
+            detector_name=None if is_yolo else cfg["detector"],
             segmentor_name="sam2",
             fov_name=None,  # skip MoGe — cam_int is cached after first run anyway
         )
+    if is_yolo:
+        from yolo_detector import YoloDetector
+        estimator.detector = YoloDetector(model_name=cfg["detector"])
 
     if cfg["compile"]:
         logger.info("  Compiling backbone…")

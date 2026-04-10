@@ -170,12 +170,17 @@ def parse_args() -> argparse.Namespace:
 # ── Model loading ─────────────────────────────────────────────────────────────
 def load_estimator(args: argparse.Namespace):
     logger.info(f"Loading SAM-3D-Body model: {args.model}")
+    detector_name = None if args.no_detector else args.detector
+    is_yolo = detector_name and detector_name.startswith("yolo")
     estimator = setup_sam_3d_body(
         hf_repo_id=args.model,
-        detector_name=None if args.no_detector else args.detector,
+        detector_name=None if is_yolo else detector_name,
         segmentor_name="sam2",
         fov_name=None if args.no_fov else "moge2",
     )
+    if is_yolo:
+        from yolo_detector import YoloDetector
+        estimator.detector = YoloDetector(model_name=detector_name)
     if args.compile:
         logger.info("Compiling ViT backbone with torch.compile (this takes ~30s)…")
         estimator.model.backbone = torch.compile(estimator.model.backbone)

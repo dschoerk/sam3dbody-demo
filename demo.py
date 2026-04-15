@@ -28,7 +28,6 @@ import argparse
 import collections
 import contextlib
 import queue
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -314,7 +313,7 @@ def run_video(estimator, video_path: Path, output_path: Path, args: argparse.Nam
     effective_fps = fps / max(args.frame_skip, 1)
 
     logger.info(f"  {width}×{height}  {fps:.2f} fps  {total} frames total")
-    logger.info(f"  frame-skip={args.frame_skip}  output fps≈{effective_fps:.2f}")
+    logger.info(f"  frame-skip={args.frame_skip}  det-interval={args.det_interval}  output fps≈{effective_fps:.2f}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -322,7 +321,15 @@ def run_video(estimator, video_path: Path, output_path: Path, args: argparse.Nam
 
     visualizer = setup_visualizer()
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    # Patch out per-frame empty_cache — stalls the GPU pipeline unnecessarily.
+    _real_empty_cache = torch.cuda.empty_cache
+    torch.cuda.empty_cache = lambda: None
+
+    cached_cam_int = None   # estimated once from first frame, reused thereafter
+    cached_bboxes  = None   # reused between detector runs (det_interval > 1)
+    processed_idx  = 0      # count of processed frames (for det_interval)
+
+    try:
         frame_idx = 0
         written = 0
         pbar = tqdm(total=total, desc="Frames", unit="fr")
@@ -333,12 +340,26 @@ def run_video(estimator, video_path: Path, output_path: Path, args: argparse.Nam
                 break
 
             if frame_idx % args.frame_skip == 0:
-                tmp_path = os.path.join(tmpdir, f"frame_{frame_idx:07d}.jpg")
-                cv2.imwrite(tmp_path, frame)
+                # Cache camera intrinsics from first frame (avoids FOV estimation per frame)
+                if cached_cam_int is None:
+                    fov_est = getattr(estimator, 'fov_estimator', None)
+                    if fov_est is not None:
+                        with _quiet():
+                            cached_cam_int = fov_est.get_cam_intrinsics(frame)
+                        logger.info("Camera intrinsics cached — FOV estimator skipped on subsequent frames.")
+
+                run_det = (cached_bboxes is None or processed_idx % args.det_interval == 0)
 
                 try:
                     with _quiet(), _autocast_ctx(args):
-                        outputs = estimator.process_one_image(tmp_path)
+                        outputs = estimator.process_one_image(
+                            frame,
+                            bboxes=None if run_det else cached_bboxes,
+                            cam_int=cached_cam_int,
+                            inference_type="body" if args.body_only else "full",
+                        )
+                    if outputs:
+                        cached_bboxes = np.stack([o["bbox"] for o in outputs])
                 except Exception as exc:
                     logger.warning(f"Frame {frame_idx}: inference error — {exc}")
                     outputs = None
@@ -351,11 +372,14 @@ def run_video(estimator, video_path: Path, output_path: Path, args: argparse.Nam
 
                 writer.write(out_frame)
                 written += 1
+                processed_idx += 1
 
             frame_idx += 1
             pbar.update(1)
 
         pbar.close()
+    finally:
+        torch.cuda.empty_cache = _real_empty_cache
 
     cap.release()
     writer.release()

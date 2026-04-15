@@ -17,3 +17,4 @@ output/
 *.pt
 *.ckpt
 *.pkl
+*.mp4
